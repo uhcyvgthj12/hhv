@@ -1,0 +1,90 @@
+name: LINUX TOOLS
+
+on:
+  workflow_dispatch:
+    inputs:
+      authcode:
+        description: 'Enter Debian ssh from crd website'
+        required: false
+
+jobs:
+  setup-vps:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Install base packages
+      run: |
+        sudo apt update && sudo apt install -y openssh-server curl wget unzip net-tools \
+          squid stunnel4 dropbear build-essential cmake git firefox brave-browser \
+          telegram-desktop
+
+    - name: Setup root password & SSH
+      run: |
+        echo "root:12345678" | sudo chpasswd
+        sudo sed -i 's/#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+        sudo sed -i 's/#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+        sudo systemctl restart ssh
+
+    - name: Setup Squid proxy
+      run: |
+        sudo bash -c 'echo -e "http_port 3128\nhttp_access allow all" > /etc/squid/squid.conf'
+        sudo systemctl restart squid
+
+    - name: Setup Dropbear
+      run: |
+        sudo apt install dropbear -y
+        sudo sed -i 's/NO_START=1/NO_START=0/' /etc/default/dropbear
+        sudo sed -i 's/DROPBEAR_PORT=22/DROPBEAR_PORT=442/' /etc/default/dropbear
+        sudo systemctl restart dropbear
+
+    - name: Install BadVPN (udpgw)
+      run: |
+        git clone https://github.com/ambrop72/badvpn.git
+        cd badvpn
+        cmake -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 .
+        make -j$(nproc)
+        sudo cp udpgw/badvpn-udpgw /usr/bin/
+        nohup badvpn-udpgw --listen-addr 127.0.0.1:7300 > /dev/null 2>&1 &
+
+    - name: Install and start Ngrok
+      env:
+        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+      run: |
+        curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+        echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+        sudo apt update && sudo apt install ngrok -y
+        ngrok config add-authtoken "$NGROK_AUTH_TOKEN"
+        nohup ngrok tcp 22 --log=stdout > ngrok.log &
+        sleep 10
+
+    - name: Extract SSH Info
+      id: sshinfo
+      run: |
+        HOSTPORT=$(curl -s http://localhost:4040/api/tunnels | grep -oE 'tcp://[^"]+' | sed 's/tcp:\/\///')
+        echo "HOSTPORT=$HOSTPORT" >> $GITHUB_ENV
+        echo "SSH INFO:"
+        echo "Username     : root"
+        echo "Password     : 12345678"
+        echo "Host/IP      : $(echo $HOSTPORT | cut -d: -f1)"
+        echo "Port ssh     : $(echo $HOSTPORT | cut -d: -f2)"
+        echo "Udp Custom   : $(echo $HOSTPORT | cut -d: -f1):7300"
+        echo "Port ssl/tls : $(echo $HOSTPORT | cut -d: -f1):443"
+        echo "Port non tls : $(echo $HOSTPORT | cut -d: -f1):80"
+        echo "Udpgw/Badvpn : $(echo $HOSTPORT | cut -d: -f1):7300"
+
+    - name: Telegram Bot Notify (optional)
+      if: env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        MSG="🖥️ *GitHub CRD VPS Ready*\n\n*SSH Login:*\nHost: $(echo $HOSTPORT | cut -d: -f1)\nPort: $(echo $HOSTPORT | cut -d: -f2)\nUser: root\nPass: 12345678\n\nPorts:\nSquid: 3128\nDropbear: 442\nSSL: 443\nUDP: 7300\n\nPowered by *GitHub Actions* 🚀"
+        curl -s -X POST https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage \
+        -d chat_id=$TELEGRAM_CHAT_ID \
+        -d text="$MSG" \
+        -d parse_mode=Markdown
+
+    - name: Cache Ngrok Logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: ngrok-log
+        path: ngrok.log
